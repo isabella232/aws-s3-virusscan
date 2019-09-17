@@ -31,6 +31,7 @@ Metadata:
       - TagKey
       - S3BucketRestriction
       - S3ObjectRestriction
+      - WhitelistedMimeTypes
     - Label:
         default: 'Auto Scaling Group Parameters'
       Parameters:
@@ -62,6 +63,10 @@ Parameters:
     Description: 'Restrict access to specific S3 objects (e.g. arn:aws:s3:::s3-virusscan-a/*,arn:aws:s3:::s3-virusscan-b/* or * to allow access to all S3 objects).'
     Type: CommaDelimitedList
     Default: '*'
+  WhitelistedMimeTypes:
+    Description: 'Comma seperated list of wildcard mimetypes to whitelist. Empty for no whitelisting. eg. image/*'
+    Type: String
+    Default: ''
   DeleteInfectedFiles:
     Description: 'Automatically delete infected files'
     Type: String
@@ -210,7 +215,6 @@ Resources:
       Period: 300
       Statistic: Maximum
       Threshold: 0
-      TreatMissingData: notBreaching
   ScanQueueEmptyAlarm:
     Type: 'AWS::CloudWatch::Alarm'
     Properties:
@@ -226,7 +230,6 @@ Resources:
       Period: 300
       Statistic: Maximum
       Threshold: 0
-      TreatMissingData: notBreaching
   ScanQueuePolicy:
     Type: 'AWS::SQS::QueuePolicy'
     Properties:
@@ -260,7 +263,6 @@ Resources:
       ComparisonOperator: GreaterThanOrEqualToThreshold
       AlarmActions:
       - !Ref FindingsTopic
-      TreatMissingData: notBreaching
   ScanQueueOldMessagesAlarm:
     Type: 'AWS::CloudWatch::Alarm'
     Properties:
@@ -277,7 +279,6 @@ Resources:
       ComparisonOperator: GreaterThanOrEqualToThreshold
       AlarmActions:
       - !Ref FindingsTopic
-      TreatMissingData: notBreaching
   ScanAutoScalingGroup:
     Type: 'AWS::AutoScaling::AutoScalingGroup'
     Properties:
@@ -414,9 +415,7 @@ Resources:
         Version: '2012-10-17'
         Statement:
         - Effect: Allow
-          Action:
-          - 's3:PutObjectTagging'
-          - 's3:PutObjectVersionTagging'
+          Action: 's3:PutObjectTagging'
           Resource: !Ref S3ObjectRestriction
           Condition:
             'ForAllValues:StringLike':
@@ -665,7 +664,7 @@ Resources:
               content: |
                 #!/usr/bin/env ruby
                 require 'daemons'
-                Daemons.run(__dir__ + '/worker.rb', {:app_name => 's3-virusscan', :monitor => true, :dir_mode => :system, :log_output_syslog => true})
+                Daemons.run(__dir__ + '/worker.rb', {:monitor => true, :log_output_syslog => true})
               mode: '000744'
               owner: root
               group: root
@@ -681,31 +680,34 @@ Resources:
                 require 'syslog/logger'
                 require 'securerandom'
 
-                $log = Syslog::Logger.new 's3-virusscan'
+                class ClamScanWorker
 
-                class Worker
-
-                  attr_reader :conf, :sns, :s3, :tag_key
+                  attr_reader :log, :conf, :sns, :tag_key, :clean_tag_set, :infected_tag_set, :whitelisted_tag_set
 
                   NO_STATUS = 'no'
                   CLEAN_STATUS = 'clean'
                   INFECTED_STATUS = 'infected'
+                  WHITELISTED_STATUS = 'whitelisted'
 
                   NO_ACTION = 'no'
                   TAG_ACTION = 'tag'
                   DELETE_ACTION = 'delete'
 
                   def initialize
+                    @log = Syslog::Logger.new 's3-virusscan'
                     @conf = YAML::load_file(__dir__ + '/s3-virusscan.conf')
                     Aws.config.update(region: conf['region'])
                     @tag_key = conf['tag_key']
+                    @clean_tag_set = {tag_set: [{key: tag_key, value: CLEAN_STATUS}]}
+                    @infected_tag_set = {tag_set: [{key: tag_key, value: INFECTED_STATUS}]}
+                    @whitelisted_tag_set = {tag_set: [{key: tag_key, value: WHITELISTED_STATUS}]}
                     @sns = Aws::SNS::Client.new()
-                    @s3 = Aws::S3::Client.new()
                   end
 
-                  def run
-                    $log.info "s3-virusscan started"
+                  def perform
+                    log.info "s3-virusscan started"
 
+                    s3 = Aws::S3::Client.new()
                     poller = Aws::SQS::QueuePoller.new(conf['queue'])
 
                     max_size = conf['volume_size'] * 1073741824 / 2 # in bytes
@@ -713,73 +715,89 @@ Resources:
                     poller.poll do |msg|
                       begin
                         body = JSON.parse(msg.body)
-                        $log.debug "body #{body}"
                         if body.key?('Records')
                           body['Records'].each do |record|
                             bucket = record['s3']['bucket']['name']
                             key = URI.decode(record['s3']['object']['key']).gsub('+', ' ')
-                            version = record['s3']['object']['versionId']
                             fileName = "/tmp/#{SecureRandom.uuid}"
                             if record['s3']['object']['size'] > max_size
-                              $log.info "s3://#{bucket}/#{key} #{version} bigger than half of the EBS volume, skip"
-                              if conf['tag_files']
-                                tag(bucket, key, version, NO_STATUS);
-                              end
-                              publish_notification(bucket, key, version, NO_STATUS, NO_ACTION);
+                              log.info "s3://#{bucket}/#{key} bigger than half of the EBS volume, skip"
+                              publish_notification(bucket, key, NO_STATUS, NO_ACTION);
                               next
                             end
-                            $log.debug "downloading s3://#{bucket}/#{key} #{version}..."
+                            log.debug "downloading s3://#{bucket}/#{key}..."
                             begin
-                              if version
-                                s3.get_object(
-                                  response_target: fileName,
-                                  bucket: bucket,
-                                  key: key
-                                )
-                              else
-                                s3.get_object(
-                                  response_target: fileName,
-                                  bucket: bucket,
-                                  key: key,
-                                  version_id: version
-                                )
+                              s3_object = s3.get_object(
+                                bucket: bucket,
+                                key: key
+                              )
+
+                              if is_content_type_whitelisted(s3_object)
+                                log.info "Content type whitelisted. Not scanning s3://#{bucket}/#{key}"
+
+                                if conf['tag_files']
+                                  s3.put_object_tagging({
+                                                          bucket: bucket,
+                                                          key: key,
+                                                          tagging: whitelisted_tag_set
+                                                        })
+                                end
+
+                                next
                               end
+
+                              s3.get_object(
+                                response_target: fileName,
+                                bucket: bucket,
+                                key: key
+                              )
                             rescue Aws::S3::Errors::NoSuchKey
-                              $log.info "s3://#{bucket}/#{key} #{version} does no longer exist, skip"
+                              log.info "s3://#{bucket}/#{key} does no longer exist, skip"
                               next
                             end
                             begin
-                              $log.info "scanning s3://#{bucket}/#{key} #{version}..."
+                              log.info "scanning s3://#{bucket}/#{key}..."
                               system("clamdscan #{fileName}")
                               exitstatus = $?.exitstatus
                               if exitstatus == 0 # No virus found.
                                 if conf['tag_files']
-                                  $log.debug "s3://#{bucket}/#{key} #{version} is clean (tagging)"
-                                  tag(bucket, key, version, CLEAN_STATUS);
+                                  log.debug "s3://#{bucket}/#{key} is clean (tagging)"
+                                  s3.put_object_tagging({
+                                      bucket: bucket,
+                                      key: key,
+                                      tagging: clean_tag_set
+                                  })
+                                  if conf['report_clean']
+                                    publish_notification(bucket, key, CLEAN_STATUS, TAG_ACTION);
+                                  end
                                 else
-                                  $log.debug "s3://#{bucket}/#{key} #{version} is clean"
-                                end
-                                if conf['report_clean']
-                                  publish_notification(bucket, key, version, CLEAN_STATUS, NO_ACTION);
+                                  log.debug "s3://#{bucket}/#{key} is clean"
+                                  if conf['report_clean']
+                                    publish_notification(bucket, key, CLEAN_STATUS, NO_ACTION);
+                                  end
                                 end
                               elsif exitstatus == 1 # Virus(es) found.
                                 if conf['delete']
-                                  $log.debug "s3://#{bucket}/#{key} #{version} is infected (deleting)"
+                                  log.debug "s3://#{bucket}/#{key} is infected (deleting)"
                                   s3.delete_object(
                                     bucket: bucket,
                                     key: key
                                   )
-                                  publish_notification(bucket, key, version, INFECTED_STATUS, DELETE_ACTION);
+                                  publish_notification(bucket, key, INFECTED_STATUS, DELETE_ACTION);
                                 elsif conf['tag_files']
-                                  $log.debug "s3://#{bucket}/#{key} #{version} is infected (tagging)"
-                                  tag(bucket, key, version, INFECTED_STATUS);
-                                  publish_notification(bucket, key, version, INFECTED_STATUS, TAG_ACTION);
+                                  log.debug "s3://#{bucket}/#{key} is infected (tagging)"
+                                  s3.put_object_tagging({
+                                      bucket: bucket,
+                                      key: key,
+                                      tagging: infected_tag_set
+                                  })
+                                  publish_notification(bucket, key, INFECTED_STATUS, TAG_ACTION);
                                 else
-                                  $log.debug "s3://#{bucket}/#{key} #{version} is infected"
-                                  publish_notification(bucket, key, version, INFECTED_STATUS, NONE_ACTION);
+                                  log.debug "s3://#{bucket}/#{key} is infected"
+                                  publish_notification(bucket, key, INFECTED_STATUS, NONE_ACTION);
                                 end
                               else # An error occured.
-                                raise "s3://#{bucket}/#{key} #{version} could not be scanned, clamdscan exit status was #{exitstatus}, retry"
+                                raise "s3://#{bucket}/#{key} could not be scanned, clamdscan exit status was #{exitstatus}, retry"
                               end
                             ensure
                               system("rm #{fileName}")
@@ -787,7 +805,7 @@ Resources:
                           end
                         end
                       rescue Exception => e
-                        $log.error "message failed: #{e.inspect} #{msg.inspect}"
+                        log.error "message failed: #{e.inspect} #{msg.inspect}"
                         raise e
                       end
                     end
@@ -795,64 +813,55 @@ Resources:
 
                   private
 
-                  def tag(bucket, key, version, status)
-                    if version
-                      s3.put_object_tagging(
-                        bucket: bucket,
-                        key: key,
-                        version_id: version,
-                        tagging: {tag_set: [{key: tag_key, value: status}]}
-                      )
-                    else
-                      s3.put_object_tagging(
-                        bucket: bucket,
-                        key: key,
-                        tagging: {tag_set: [{key: tag_key, value: status}]}
-                      )
-                    end
-                  end
-
-                  def publish_notification(bucket, key, version, status, action)
-                    message_attributes = {
-                      "bucket" => {
-                        data_type: "String",
-                        string_value: bucket
-                      },
-                      "key" => {
-                        data_type: "String",
-                        string_value: key
-                      },
-                      "status" => {
-                        data_type: "String",
-                        string_value: status
-                      },
-                      "action" => {
-                        data_type: "String",
-                        string_value: action
-                      }
-                    }
-                    if version
-                      message_attributes[:version] = {
-                        data_type: "String",
-                        string_value: version
-                      }
-                    end
+                  def publish_notification(bucket, key, status, action)
                     sns.publish(
                       topic_arn: conf['topic'],
-                      message: "s3://#{bucket}/#{key} #{version} is #{status}, #{action} action executed",
+                      message: "s3://#{bucket}/#{key} is #{status}, #{action} action executed",
                       subject: "s3-virusscan s3://#{bucket}",
-                      message_attributes: message_attributes
+                      message_attributes: {
+                        "bucket" => {
+                          data_type: "String",
+                          string_value: bucket
+                        },
+                        "key" => {
+                          data_type: "String",
+                          string_value: key
+                        },
+                        "status" => {
+                          data_type: "String",
+                          string_value: status
+                        },
+                        "action" => {
+                          data_type: "String",
+                          string_value: action
+                        }
+                      }
                     )
                   end
 
+                  def is_content_type_whitelisted(s3_object)
+                    return false unless !conf['whitelisted_mimetypes'].nil? && !conf['whitelisted_mimetypes'].empty?
+
+                    content_type = s3_object.content_type
+
+                    conf['whitelisted_mimetypes'].split(",").map(&:strip).each do |mimetype|
+                      if mimetype.end_with?('*')
+                        if content_type.start_with?(mimetype.chop)
+                          return true
+                        else
+                          if content_type == mimetype
+                            return true
+                          end
+
+                          return false
+                        end
+                      end
+                    end
+                  end
                 end
 
-                begin
-                  Worker.new.run
-                rescue Exception => e
-                  $log.error "worker failed: #{e.inspect}"
-                  raise e
-                end
+                # do some work
+                ClamScanWorker.new.perform
               mode: '000744'
               owner: root
               group: root
@@ -866,6 +875,7 @@ Resources:
                 queue: ${ScanQueue}
                 topic: ${FindingsTopic}
                 volume_size: ${VolumeSize}
+                whitelisted_mimetypes: ${WhitelistedMimeTypes}
               mode: '000644'
               owner: root
               group: root
