@@ -31,6 +31,7 @@ Metadata:
       - TagKey
       - S3BucketRestriction
       - S3ObjectRestriction
+      - WhitelistedMimeTypes
     - Label:
         default: 'Auto Scaling Group Parameters'
       Parameters:
@@ -62,6 +63,10 @@ Parameters:
     Description: 'Restrict access to specific S3 objects (e.g. arn:aws:s3:::s3-virusscan-a/*,arn:aws:s3:::s3-virusscan-b/* or * to allow access to all S3 objects).'
     Type: CommaDelimitedList
     Default: '*'
+  WhitelistedMimeTypes:
+    Description: 'Comma seperated list of wildcard mimetypes to whitelist. Empty for no whitelisting. eg. image/*,video/mp4'
+    Type: String
+    Default: ''
   DeleteInfectedFiles:
     Description: 'Automatically delete infected files'
     Type: String
@@ -690,6 +695,7 @@ Resources:
                   NO_STATUS = 'no'
                   CLEAN_STATUS = 'clean'
                   INFECTED_STATUS = 'infected'
+                  WHITELISTED_STATUS = 'whitelisted'
 
                   NO_ACTION = 'no'
                   TAG_ACTION = 'tag'
@@ -731,13 +737,13 @@ Resources:
                             $log.debug "downloading s3://#{bucket}/#{key} #{version}..."
                             begin
                               if version
-                                s3.get_object(
+                                s3_object = s3.get_object(
                                   response_target: fileName,
                                   bucket: bucket,
                                   key: key
                                 )
                               else
-                                s3.get_object(
+                                s3_object = s3.get_object(
                                   response_target: fileName,
                                   bucket: bucket,
                                   key: key,
@@ -749,6 +755,16 @@ Resources:
                               next
                             end
                             begin
+                              if is_content_type_whitelisted(s3_object)
+                                $log.info "Content type whitelisted. Not scanning s3://#{bucket}/#{key} #{version}"
+
+                                if conf['tag_files']
+                                  tag(bucket, key, version, WHITELISTED_STATUS)
+                                end
+
+                                next
+                              end
+
                               $log.info "scanning s3://#{bucket}/#{key} #{version}..."
                               system("clamdscan #{fileName}")
                               exitstatus = $?.exitstatus
@@ -845,6 +861,23 @@ Resources:
                     )
                   end
 
+                  def is_content_type_whitelisted(s3_object)
+                    return false unless !conf['whitelisted_mimetypes'].nil? && !conf['whitelisted_mimetypes'].empty?
+                    content_type = s3_object.content_type
+
+                    conf['whitelisted_mimetypes'].split(",").map(&:strip).each do |mimetype|
+                      if mimetype.end_with?('*')
+                        if content_type.start_with?(mimetype.chop)
+                          return true
+                        end
+                      elsif content_type == mimetype
+                         return true
+                      end
+                    end
+
+                    return false
+                  end
+
                 end
 
                 begin
@@ -866,6 +899,7 @@ Resources:
                 queue: ${ScanQueue}
                 topic: ${FindingsTopic}
                 volume_size: ${VolumeSize}
+                whitelisted_mimetypes: ${WhitelistedMimeTypes}
               mode: '000644'
               owner: root
               group: root
