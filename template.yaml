@@ -456,6 +456,108 @@ Resources:
     Type: 'AWS::Logs::LogGroup'
     Properties:
       RetentionInDays: !Ref LogsRetentionInDays
+  Dashboard:
+    Type: 'AWS::CloudWatch::Dashboard'
+    Properties:
+      DashboardName: VirusScan
+      DashboardBody:
+        Fn::Sub:
+        - |
+          {
+              "widgets": [
+                  {
+                      "type": "metric",
+                      "x": 0,
+                      "y": 0,
+                      "width": 12,
+                      "height": 6,
+                      "properties": {
+                          "metrics": [
+                              [ "AWS/SQS", "ApproximateNumberOfMessagesNotVisible", "QueueName", "${ScanQueueName}" ]
+                          ],
+                          "view": "timeSeries",
+                          "stacked": false,
+                          "region": "us-east-1",
+                          "period": 300,
+                          "stat": "Average"
+                      }
+                  },
+                  {
+                      "type": "metric",
+                      "x": 12,
+                      "y": 0,
+                      "width": 12,
+                      "height": 6,
+                      "properties": {
+                          "metrics": [
+                              [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${ScanQueueName}"],
+                              [ "...", "${ScanQueueDLQName}" ]
+                          ],
+                          "view": "timeSeries",
+                          "stacked": false,
+                          "region": "us-east-1",
+                          "period": 300,
+                          "stat": "Average"
+                      }
+                  },
+                  {
+                      "type": "metric",
+                      "x": 6,
+                      "y": 6,
+                      "width": 12,
+                      "height": 6,
+                      "properties": {
+                          "metrics": [
+                              [ "AWS/SQS", "NumberOfMessagesDeleted", "QueueName", "${ScanQueueName}" ]
+                          ],
+                          "view": "timeSeries",
+                          "stacked": false,
+                          "region": "us-east-1",
+                          "period": 300,
+                          "stat": "Average"
+                      }
+                  },
+                  {
+                      "type": "metric",
+                      "x": 0,
+                      "y": 6,
+                      "width": 6,
+                      "height": 6,
+                      "properties": {
+                          "metrics": [
+                              [ "AWS/SQS", "ApproximateAgeOfOldestMessage", "QueueName", "${ScanQueueName}" ],
+                              [ "...", "${ScanQueueDLQName}" ]
+                          ],
+                          "view": "timeSeries",
+                          "stacked": false,
+                          "region": "us-east-1",
+                          "period": 300,
+                          "stat": "Average"
+                      }
+                  },
+                  {
+                      "type": "metric",
+                      "x": 18,
+                      "y": 6,
+                      "width": 6,
+                      "height": 6,
+                      "properties": {
+                          "view": "timeSeries",
+                          "stacked": false,
+                          "metrics": [
+                              [ "AWS/AutoScaling", "GroupDesiredCapacity", "AutoScalingGroupName", "${AutoScalingGroupName}"  ],
+                              [ ".", "GroupMaxSize", ".", "." ],
+                              [ ".", "GroupTotalCapacity", ".", "." ]
+                          ],
+                          "region": "us-east-1",
+                          "period": 300
+                      }
+                  }
+              ]
+          }
+        - ScanQueueName: !GetAtt 'ScanQueue.QueueName'
+          ScanQueueDLQName: !GetAtt 'ScanQueueDLQ.QueueName'
+          AutoScalingGroupName: !Ref ScanAutoScalingGroup
   ScanLaunchConfiguration:
     Type: 'AWS::AutoScaling::LaunchConfiguration'
     Metadata:
